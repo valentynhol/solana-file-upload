@@ -10,18 +10,28 @@ import { Program, AnchorProvider } from '@coral-xyz/anchor';
 import type { Idl } from '@coral-xyz/anchor';
 import bs58 from 'bs58';
 import { Buffer } from 'buffer';
-import nacl from 'tweetnacl';
 import idl from '../../target/idl/solana_chunk_uploader.json';
+import './App.css';
 
 const PROGRAM_ID = new PublicKey(idl.address);
-
-
 const CHUNK_SIZE = 800; // 800 Bytes (well within the raw 1232 MTU limit)
 
+function formatBytes(bytes: number, decimals = 2) {
+  if (!+bytes) return '0 Bytes';
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+}
+
 function App() {
-  const [status, setStatus] = useState('');
+  const [status, setStatus] = useState('Idle');
   const [fileIdToDownload, setFileIdToDownload] = useState('');
-  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  
+  const [isDragging, setIsDragging] = useState(false);
+  const [uploadedFile, setUploadedFile] = useState<{name: string, size: number, id: string} | null>(null);
+  const [downloadedFile, setDownloadedFile] = useState<{name: string, size: number, url: string} | null>(null);
   
   // Create a throwaway wallet for testing
   const walletRef = useRef(Keypair.generate());
@@ -66,6 +76,7 @@ function App() {
 
   const uploadFile = async (file: File) => {
     try {
+      setUploadedFile(null);
       await setupWallet();
       setStatus(`Uploading ${file.name}...`);
       const provider = getProvider();
@@ -73,9 +84,6 @@ function App() {
       
       const fileId = Math.random().toString(36).substring(2, 10);
       const buffer = new Uint8Array(await file.arrayBuffer());
-      
-      // Compute manifestPda if needed or remove completely. Since we don't use it, we can just omit it here.
-      // const [manifestPda] = PublicKey.findProgramAddressSync(...);
 
       setStatus('Initializing file manifest...');
       await program.methods
@@ -92,10 +100,7 @@ function App() {
         setStatus(`Uploading chunk ${i + 1}/${numChunks}...`);
         const chunkBytes = buffer.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
         
-        // Construct the instruction to upload chunk manually to avoid Anchor's serialization stack limit
-        // The discriminator for `upload_chunk` is: [130, 219, 165, 153, 119, 149, 252, 162]
         const discriminator = Buffer.from([130, 219, 165, 153, 119, 149, 252, 162]);
-        // The parameter is a Vec<u8> which expects a 4-byte length prefix (u32 little endian) followed by the bytes.
         const lenBuf = Buffer.alloc(4);
         lenBuf.writeUInt32LE(chunkBytes.length, 0);
         const ixData = Buffer.concat([discriminator, lenBuf, Buffer.from(chunkBytes)]);
@@ -117,7 +122,6 @@ function App() {
         const transaction = new solanaWeb3.VersionedTransaction(messageV0);
         transaction.sign([wallet]);
         
-        // Ensure encoded in Base64 explicitly
         const rawTx = transaction.serialize();
         const base64Tx = Buffer.from(rawTx).toString('base64');
         const signature = await connection.sendEncodedTransaction(base64Tx, { skipPreflight: true, maxRetries: 3 });
@@ -127,7 +131,6 @@ function App() {
         signatures.push(sigBytes);
       }
       
-      // Append signatures in batches
       const BATCH_SIZE = 10;
       for (let i = 0; i < signatures.length; i += BATCH_SIZE) {
         setStatus(`Appending signatures batch ${i / BATCH_SIZE + 1}...`);
@@ -140,7 +143,12 @@ function App() {
           .rpc();
       }
 
-      setStatus(`Upload complete! File ID: ${fileId}`);
+      setStatus(`Upload complete!`);
+      setUploadedFile({
+        name: file.name,
+        size: file.size,
+        id: fileId
+      });
     } catch (e: any) {
       console.error(e);
       setStatus(`Upload error: ${e.message}`);
@@ -148,7 +156,9 @@ function App() {
   };
 
   const downloadFile = async (id: string) => {
+    if (!id) return;
     try {
+      setDownloadedFile(null);
       setStatus(`Fetching manifest for ${id}...`);
       const provider = getProvider();
       const program = new Program(idl as Idl, provider);
@@ -168,27 +178,24 @@ function App() {
         const sigBytes = chunkSignatures[i];
         const signature = bs58.encode(Uint8Array.from(sigBytes));
         
-        // Fetch transaction with maxSupportedTransactionVersion: 1
-        const tx = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 1 });
+        let tx = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
         if (!tx) {
-          throw new Error(`Transaction ${signature} not found`);
+          for (let retries = 0; retries < 15; retries++) {
+            await new Promise((r) => setTimeout(r, 2000)); // wait up to 30 seconds
+            tx = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
+            if (tx) break;
+          }
         }
+        if (!tx) throw new Error(`Transaction ${signature} not found after retries`);
         
-        // Extract the chunk bytes
-        // The message could be v0 or legacy. We'll handle both.
         const message = tx.transaction.message;
-        
         let instructions: any[] = [];
         if ('compiledInstructions' in message) {
-            // Versioned transaction (v0)
             instructions = message.compiledInstructions;
         } else {
-            // Legacy transaction
             instructions = (message as any).instructions;
         }
         
-        // Assuming the upload_chunk is the first and only instruction
-        // The data is: 8-byte discriminator + 4-byte length prefix + chunk bytes
         const ixData = Buffer.from(instructions[0].data);
         const chunk = ixData.slice(12);
         chunks.push(chunk);
@@ -196,8 +203,12 @@ function App() {
       
       const blob = new Blob(chunks as any, { type: manifest.mimeType });
       const url = URL.createObjectURL(blob);
-      setDownloadUrl(url);
-      setStatus(`Download ready: ${manifest.filename}`);
+      setDownloadedFile({
+        name: manifest.filename,
+        size: blob.size,
+        url
+      });
+      setStatus(`Download ready`);
       
     } catch (e: any) {
       console.error(e);
@@ -205,40 +216,89 @@ function App() {
     }
   };
 
+  const onDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const onDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+  };
+
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      uploadFile(e.dataTransfer.files[0]);
+    }
+  };
+
   return (
-    <div style={{ padding: '20px', fontFamily: 'sans-serif' }}>
-      <h1>Solana L1 File Uploader</h1>
+    <div className="container">
+      <h1>Solana File Storage</h1>
       
-      <div style={{ marginBottom: '20px', padding: '10px', border: '1px solid #ccc' }}>
-        <h3>Upload File</h3>
-        <input 
-          type="file" 
-          onChange={(e) => {
-            if (e.target.files && e.target.files[0]) {
-              uploadFile(e.target.files[0]);
-            }
-          }} 
-        />
-      </div>
-      
-      <div style={{ marginBottom: '20px', padding: '10px', border: '1px solid #ccc' }}>
-        <h3>Download File</h3>
-        <input 
-          type="text" 
-          placeholder="File ID" 
-          value={fileIdToDownload} 
-          onChange={(e) => setFileIdToDownload(e.target.value)} 
-        />
-        <button onClick={() => downloadFile(fileIdToDownload)}>Fetch File</button>
-        {downloadUrl && (
-          <div style={{ marginTop: '10px' }}>
-            <a href={downloadUrl} download>Download File</a>
+      <div className="section">
+        <h3 className="section-title">Upload File</h3>
+        <label 
+          className={`dropzone ${isDragging ? 'active' : ''}`}
+          onDragOver={onDragOver}
+          onDragLeave={onDragLeave}
+          onDrop={onDrop}
+        >
+          <input 
+            type="file" 
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              if (e.target.files && e.target.files[0]) {
+                uploadFile(e.target.files[0]);
+              }
+            }} 
+          />
+          <div className="dropzone-text">
+            <strong>Click to select</strong> or drag and drop a file here
+          </div>
+        </label>
+        
+        {uploadedFile && (
+          <div className="file-info success">
+            <div style={{ marginBottom: '4px' }}>🎉 Uploaded <strong>{uploadedFile.name}</strong> ({formatBytes(uploadedFile.size)})</div>
+            <div>
+              File ID: <code className="code-id">{uploadedFile.id}</code>
+            </div>
           </div>
         )}
       </div>
       
-      <div style={{ padding: '10px', backgroundColor: '#f0f0f0' }}>
-        <strong>Status:</strong> {status}
+      <div className="section">
+        <h3 className="section-title">Download File</h3>
+        <div style={{ display: 'flex', gap: '10px' }}>
+          <input 
+            className="input"
+            type="text" 
+            placeholder="Enter File ID" 
+            value={fileIdToDownload} 
+            onChange={(e) => setFileIdToDownload(e.target.value)} 
+          />
+          <button className="button" onClick={() => downloadFile(fileIdToDownload)}>
+            Fetch File
+          </button>
+        </div>
+        
+        {downloadedFile && (
+          <div className="file-info success download-ready">
+            <div>
+              Ready: <strong>{downloadedFile.name}</strong> ({formatBytes(downloadedFile.size)})
+            </div>
+            <a className="button button-outline" href={downloadedFile.url} download={downloadedFile.name}>
+              Download
+            </a>
+          </div>
+        )}
+      </div>
+      
+      <div className="status-bar">
+        <span className="status-label">Status:</span> {status}
       </div>
     </div>
   );
